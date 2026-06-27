@@ -1,0 +1,14 @@
+# build / tooling
+/out/
+/godot
+.godot/
+*.tmp
+.secrets.env
+/verify/
+/playbooks/
+*.import
+# binary assets are reconstructed by ./fetch_assets.sh (kept out of git to stay light)
+/audio/*.ogg
+/audio/*.wav
+/skies/*.hdr
+/models/*.glb
