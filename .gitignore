@@ -1,0 +1,10 @@
+# build / tooling
+/out/
+/godot
+.godot/
+*.tmp
+.secrets.env
+/verify/
+/playbooks/
+*.import
+# keep the project lean; the engine binary + web export are not committed
