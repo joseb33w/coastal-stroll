@@ -10,7 +10,7 @@ const WALK_SPEED := 4.2
 const GRAVITY := 22.0
 const STEP_DIST := 2.1
 const SAVE_INTERVAL := 3.0
-const PLAYER_MODEL := "realistic_characters/vanguard.glb"
+const PLAYER_MODEL := "models/civ_walker.glb"
 
 const ZONE_NAMES := {"city": "Downtown", "forest": "Forest", "beach": "Beach"}
 const TOTAL_PLACES := 6
@@ -73,6 +73,7 @@ func _ready() -> void:
 	_build_environment()
 	_build_player()
 	_build_hud()
+	_show_loading()
 	AudioManager.show_tap_overlay()
 	_setup_audio()
 
@@ -123,6 +124,7 @@ func _boot() -> void:
 	await assets.ensure([PLAYER_MODEL])
 	avatar = assets.get_instance(PLAYER_MODEL)
 	if avatar != null:
+		avatar.visible = false   # hidden until the world is ready (no falling-avatar on boot)
 		player.add_child(avatar)
 		anim = _find_anim(avatar)
 		_loop_clips(anim)
@@ -145,7 +147,10 @@ func _boot() -> void:
 	await streamer.start(world, has_resume, rpos, rface)
 	if has_resume and avatar != null:
 		avatar.rotation.y = rface
+	if avatar != null:
+		avatar.visible = true
 	world_ready = true
+	_hide_loading()
 
 
 func _wait_supabase() -> Dictionary:
@@ -168,6 +173,11 @@ func _wait_supabase() -> Dictionary:
 
 func _physics_process(delta: float) -> void:
 	if player == null:
+		return
+	if not world_ready:
+		# the world is still streaming the spawn cell in — keep the body frozen so it can't
+		# free-fall through the not-yet-built ground (a loading veil hides this on web).
+		player.velocity = Vector3.ZERO
 		return
 	var v := _keyboard_vec() + move_vec
 	if v.length() > 1.0:
@@ -237,8 +247,8 @@ func _dbg(delta: float) -> void:
 	if interiors != null:
 		nb = interiors.buildings.size()
 		bat = String(interiors.building_at(p).get("place", ""))
-	var js := "window.__dbg={booted:1,ready:%d,px:%f,pz:%f,yaw:%f,zone:'%s',inside:'%s',bat:'%s',disc:%d,buildings:%d}" % [
-		1 if world_ready else 0, p.x, p.z, yaw, z, inside_place, bat, discovered.size(), nb]
+	var js := "window.__dbg={booted:1,ready:%d,px:%f,py:%f,pz:%f,oy:%d,cy:%f,yaw:%f,zone:'%s',inside:'%s',bat:'%s',disc:%d,buildings:%d}" % [
+		1 if world_ready else 0, p.x, p.y, p.z, (1 if player.is_on_floor() else 0), cam.global_position.y, yaw, z, inside_place, bat, discovered.size(), nb]
 	JavaScriptBridge.eval(js, true)
 
 
@@ -249,6 +259,11 @@ func _dbg_cmd(c: String) -> void:
 		player.global_position = Vector3(ctr.x, 0.6, ctr.z)
 		player.velocity = Vector3.ZERO
 		_update_building_state()
+	elif c.begins_with("goto:"):
+		var parts := c.substr(5).split(",")
+		if parts.size() >= 2:
+			player.global_position = Vector3(int(parts[0]) * 20.0 + 10.0, 0.6, int(parts[1]) * 20.0 + 10.0)
+			player.velocity = Vector3.ZERO
 
 
 func _keyboard_vec() -> Vector2:
@@ -278,7 +293,11 @@ func _update_camera(delta: float) -> void:
 	q.exclude = [player]
 	var hit := space.intersect_ray(q)
 	if hit.has("position"):
-		desired = (hit["position"] as Vector3) + (look - desired).normalized() * 0.4
+		var pulled := (hit["position"] as Vector3) + (look - desired).normalized() * 0.4
+		# don't yank to an extreme close-up: keep a minimum distance from the look point
+		if pulled.distance_to(look) < 3.0:
+			pulled = look + (pulled - look).normalized() * 3.0
+		desired = pulled
 	cam.global_position = cam.global_position.lerp(desired, clampf(delta * 8.0, 0.0, 1.0))
 	cam.look_at(look, Vector3.UP)
 
@@ -370,12 +389,12 @@ func _build_environment() -> void:
 	env = Environment.new()
 	env.background_mode = Environment.BG_SKY
 	env.ambient_light_source = Environment.AMBIENT_SOURCE_SKY
-	env.ambient_light_sky_contribution = 0.6
+	env.ambient_light_sky_contribution = 0.72
 	env.tonemap_mode = Environment.TONE_MAPPER_AGX
-	env.tonemap_exposure = 0.92
+	env.tonemap_exposure = 1.02
 	env.fog_enabled = true
 	env.fog_light_color = Color(0.80, 0.84, 0.88)
-	env.fog_density = 0.0055
+	env.fog_density = 0.004
 	env.fog_sky_affect = 0.15
 	var sky := Sky.new()
 	var sky_tex = load("res://skies/coast_sky.hdr")
@@ -579,3 +598,30 @@ func _joy_show(active: bool, base: Vector2, knob: Vector2) -> void:
 	joy.base_pos = base
 	joy.knob_pos = knob
 	joy.queue_redraw()
+
+
+# ---------------- loading veil (covers the boot stream-in) ----------------
+
+var loading_veil: CanvasLayer
+
+func _show_loading() -> void:
+	loading_veil = CanvasLayer.new()
+	loading_veil.layer = 150
+	add_child(loading_veil)
+	var dim := ColorRect.new()
+	dim.color = Color(0.06, 0.08, 0.11, 1.0)
+	dim.set_anchors_preset(Control.PRESET_FULL_RECT)
+	loading_veil.add_child(dim)
+	var lbl := Label.new()
+	lbl.text = "Loading the coast..."
+	lbl.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	lbl.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	lbl.add_theme_font_size_override("font_size", 34)
+	lbl.add_theme_color_override("font_color", Color(0.85, 0.9, 0.95))
+	lbl.set_anchors_preset(Control.PRESET_FULL_RECT)
+	loading_veil.add_child(lbl)
+
+func _hide_loading() -> void:
+	if loading_veil != null and is_instance_valid(loading_veil):
+		loading_veil.queue_free()
+		loading_veil = null

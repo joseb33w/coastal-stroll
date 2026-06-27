@@ -37,7 +37,7 @@ const PALETTE := {
 	"palm": "props/fs_terrain/beach_prop_tree_palm_1.glb",
 	"palm2": "props/fs_terrain/beach_prop_tree_palm_2.glb",
 }
-const PED_MODELS := ["realistic_characters/vanguard.glb", "realistic_characters/soldier.glb", "realistic_characters/warden.glb"]
+const PED_MODELS := ["models/civ_woman.glb", "models/civ_man2.glb", "models/civ_walker.glb"]
 
 var resident := {}
 var _queue: Array = []
@@ -90,12 +90,12 @@ func start(world: Dictionary, has_resume := false, resume_pos := Vector3.ZERO, _
 			spawn_pos = resume_pos + Vector3(0, 0.3, 0)
 
 	_build_ocean()
-	_started = true
 	_cur = spawn_cell
-	await _build_at(spawn_cell.x, spawn_cell.y)   # build under the player BEFORE positioning (no fall)
-	player.global_position = spawn_pos
+	await _build_at(spawn_cell.x, spawn_cell.y)   # _started=false here -> tick is inert, no spurious
+	player.global_position = spawn_pos             # discovery from the player's temporary boot position
 	if player is CharacterBody3D:
 		(player as CharacterBody3D).velocity = Vector3.ZERO
+	_started = true
 	_rebuild_nav()
 	_update_ring(spawn_cell)
 	current_cell_id = _area_id(spawn_cell)
@@ -117,7 +117,13 @@ func tick(delta: float) -> void:
 			var z := String(grid[_key(here.x, here.y)].get("zone", current_zone))
 			current_zone = z
 			cell_changed.emit(current_zone, current_cell_id)
-	if not _building and not _queue.is_empty():
+	# the player's OWN cell must exist NOW so they never stand over a hole (fast move / teleport)
+	if not _building and grid.has(_key(_cur.x, _cur.y)) and not resident.has(_key(_cur.x, _cur.y)):
+		_building = true
+		await _build_at(_cur.x, _cur.y)
+		_rebuild_nav()
+		_building = false
+	elif not _building and not _queue.is_empty():
 		var nxt: Vector2i = _queue.pop_front()
 		if not resident.has(_key(nxt.x, nxt.y)) and grid.has(_key(nxt.x, nxt.y)):
 			_building = true
@@ -146,11 +152,15 @@ func _update_ring(centre: Vector2i) -> void:
 		_queue.append(cell)
 
 func _priority(a: Vector2i, b: Vector2i, centre: Vector2i) -> bool:
+	# nearest-first so the player's OWN cell (Chebyshev 0) always builds before neighbours
+	# (prevents floating over a hole on a fast move / teleport); heading breaks ties.
+	var ca := _cheb(a, centre)
+	var cb := _cheb(b, centre)
+	if ca != cb:
+		return ca < cb
 	var ah := (a - centre).x * _heading.x + (a - centre).y * _heading.y
 	var bh := (b - centre).x * _heading.x + (b - centre).y * _heading.y
-	if ah != bh:
-		return ah > bh
-	return _cheb(a, centre) < _cheb(b, centre)
+	return ah > bh
 
 func _evict(k: String) -> void:
 	var rec = resident.get(k)
@@ -171,14 +181,32 @@ func _build_at(gx: int, gz: int) -> void:
 	if resident.has(k) or not grid.has(k):
 		return
 	var rec: Dictionary = grid[k]
-	var root := await _build_cell(rec, gx, gz)
-	resident[k] = {"root": root}
+	await _build_cell(rec, gx, gz)   # registers `resident` itself once the floor exists
 
 func _build_cell(rec: Dictionary, gx: int, gz: int) -> Node3D:
 	var half := cell_size * 0.5
 	var centre := Vector3(float(gx) * cell_size + half, 0.0, float(gz) * cell_size + half)
 
-	# gather every asset url for ONE parallel download
+	var root := Node3D.new()
+	world_main.add_child(root)
+
+	# --- BUILD THE GROUND + WALLS + BUILDINGS FIRST (no downloads) so the player never
+	# floats over a hole while the cell's streamed scenery is still downloading. ---
+	var gcol := assets.col(rec.get("ground", [0.3, 0.32, 0.35]))
+	assets.make_box(root, centre + Vector3(0, -0.5, 0), Vector3(cell_size, 1.0, cell_size), gcol, false)
+	var apron := half * 0.25
+	_edge(root, gx, gz, 0, -1, centre + Vector3(0, -0.5, -half - apron * 0.5), Vector3(cell_size, 1.0, apron), centre + Vector3(0, 2.0, -half), Vector3(cell_size, 5.0, 0.4))
+	_edge(root, gx, gz, 0, 1, centre + Vector3(0, -0.5, half + apron * 0.5), Vector3(cell_size, 1.0, apron), centre + Vector3(0, 2.0, half), Vector3(cell_size, 5.0, 0.4))
+	_edge(root, gx, gz, -1, 0, centre + Vector3(-half - apron * 0.5, -0.5, 0), Vector3(apron, 1.0, cell_size), centre + Vector3(-half, 2.0, 0), Vector3(0.4, 5.0, cell_size))
+	_edge(root, gx, gz, 1, 0, centre + Vector3(half + apron * 0.5, -0.5, 0), Vector3(apron, 1.0, cell_size), centre + Vector3(half, 2.0, 0), Vector3(0.4, 5.0, cell_size))
+	# procedural buildings (towers/cabs/enterable; their furniture is pre-cached in start()) — instant
+	for b in rec.get("buildings", []):
+		if typeof(b) == TYPE_DICTIONARY:
+			interiors.build(b, centre, root, _key(gx, gz))
+	# register NOW (floor exists) so eviction can free it if the player leaves mid-download
+	resident[_key(gx, gz)] = {"root": root}
+
+	# --- now stream the scenery assets in parallel, then place them (they pop in) ---
 	var urls: Array = []
 	_collect_urls(rec.get("scatter", []), urls)
 	_collect_urls(rec.get("props", []), urls)
@@ -187,31 +215,11 @@ func _build_cell(rec: Dictionary, gx: int, gz: int) -> Node3D:
 		var lu := _ref_url(lm)
 		if lu != "" and not urls.has(lu):
 			urls.append(lu)
-	var peds = rec.get("pedestrians", null)
-	if typeof(peds) == TYPE_ARRAY:
-		for pd in peds:
-			if typeof(pd) == TYPE_DICTIONARY and pd.has("model"):
-				var pu := String(pd.get("model"))
-				if pu != "" and not urls.has(pu):
-					urls.append(pu)
 	if not urls.is_empty():
 		await assets.ensure(urls)
+	if not is_instance_valid(root):
+		return root   # cell was evicted while its assets downloaded
 
-	var root := Node3D.new()
-	world_main.add_child(root)
-
-	# floor slab (no self-shadow), colored by zone ground
-	var gcol := assets.col(rec.get("ground", [0.3, 0.32, 0.35]))
-	assets.make_box(root, centre + Vector3(0, -0.5, 0), Vector3(cell_size, 1.0, cell_size), gcol, false)
-
-	# edges: apron over shared edges (anti fall-through); invisible barrier on world borders
-	var apron := half * 0.25
-	_edge(root, gx, gz, 0, -1, centre + Vector3(0, -0.5, -half - apron * 0.5), Vector3(cell_size, 1.0, apron), centre + Vector3(0, 2.0, -half), Vector3(cell_size, 5.0, 0.4))
-	_edge(root, gx, gz, 0, 1, centre + Vector3(0, -0.5, half + apron * 0.5), Vector3(cell_size, 1.0, apron), centre + Vector3(0, 2.0, half), Vector3(cell_size, 5.0, 0.4))
-	_edge(root, gx, gz, -1, 0, centre + Vector3(-half - apron * 0.5, -0.5, 0), Vector3(apron, 1.0, cell_size), centre + Vector3(-half, 2.0, 0), Vector3(0.4, 5.0, cell_size))
-	_edge(root, gx, gz, 1, 0, centre + Vector3(half + apron * 0.5, -0.5, 0), Vector3(apron, 1.0, cell_size), centre + Vector3(half, 2.0, 0), Vector3(0.4, 5.0, cell_size))
-
-	# scenery
 	var lmark = rec.get("landmark", null)
 	if typeof(lmark) == TYPE_DICTIONARY:
 		_place_one(root, lmark, centre, half)
@@ -224,12 +232,7 @@ func _build_cell(rec: Dictionary, gx: int, gz: int) -> Node3D:
 	for s in rec.get("scatter", []):
 		_place_scatter(root, s, centre, half)
 
-	# buildings (towers + enterable)
-	for b in rec.get("buildings", []):
-		if typeof(b) == TYPE_DICTIONARY:
-			interiors.build(b, centre, root, _key(gx, gz))
-
-	# pedestrians
+	# pedestrians (their models are pre-cached in start())
 	_spawn_peds(rec, centre, half, root)
 
 	return root
@@ -343,14 +346,14 @@ func _make_ped(root: Node, url: String, pos: Vector3, radius: float) -> void:
 
 func _build_ocean() -> void:
 	var max_gx := -2147483648
-	var max_gz := -2147483648
+	var min_gz := 2147483647
 	var min_gx := 2147483647
 	for k: String in grid.keys():
 		var parts := k.split(",")
 		min_gx = mini(min_gx, int(parts[0]))
 		max_gx = maxi(max_gx, int(parts[0]))
-		max_gz = maxi(max_gz, int(parts[1]))
-	var south := float(max_gz + 1) * cell_size
+		min_gz = mini(min_gz, int(parts[1]))
+	var north := float(min_gz) * cell_size   # the beach's north edge (z=0 for gz=0)
 	var x0 := float(min_gx) * cell_size - 40.0
 	var x1 := float(max_gx + 1) * cell_size + 40.0
 	var width := x1 - x0
@@ -365,7 +368,7 @@ func _build_ocean() -> void:
 	var sh := ShaderMaterial.new()
 	sh.shader = preload("res://shaders/water.gdshader")
 	mi.material_override = sh
-	mi.position = Vector3((x0 + x1) * 0.5, -0.25, south + 124.0)
+	mi.position = Vector3((x0 + x1) * 0.5, -0.25, north - 124.0)   # ocean stretches NORTH of the shore
 	_ocean.add_child(mi)
 
 # ---------------- shared flat nav (best-effort for peds; players don't need it) ----------------
